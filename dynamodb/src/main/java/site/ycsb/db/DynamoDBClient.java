@@ -58,6 +58,12 @@ public class DynamoDBClient extends DB {
   private boolean useLegacyAPI = false;
   private String primaryKeyName;
   private PrimaryKeyType primaryKeyType = PrimaryKeyType.HASH;
+  private enum ExpressionGenerator {
+    COUNTER,
+    HASH,
+    RANDOM,
+  }
+  private ExpressionGenerator expressionGenerator = ExpressionGenerator.COUNTER;
 
   // If the user choose to use HASH_AND_RANGE as primary key type, then
   // the following two variables become relevant. See documentation in the
@@ -128,6 +134,15 @@ public class DynamoDBClient extends DB {
       throw new DBException("Missing primary key attribute name, cannot continue");
     }
 
+    if (null != getProperties().getProperty("dynamodb.expressionGenerator")) {
+      try {
+        this.expressionGenerator = ExpressionGenerator.valueOf(
+          getProperties().getProperty("dynamodb.expressionGenerator").trim().toUpperCase());
+      } catch (IllegalArgumentException e) {
+        throw new DBException("Invalid expression generator specified: Expecting COUNTER, HASH, or RANDOM.");
+      }
+    }
+
     if (null != primaryKeyTypeString) {
       try {
         this.primaryKeyType = PrimaryKeyType.valueOf(primaryKeyTypeString.trim().toUpperCase());
@@ -178,18 +193,34 @@ public class DynamoDBClient extends DB {
   }
 
   // DynamoDB has reserved words and signs, so lets alias all fields
-  private String getAlias(String prefix, Map<String, ?> existing) {
-    return prefix + "X" + existing.size();
+  private String getAlias(String prefix, String repr, Map<String, ?> existing) {
+    String alias;
+    switch (this.expressionGenerator) {
+    case COUNTER:
+    default:
+      return prefix + "X" + existing.size();
+    case HASH:
+      alias = prefix + Integer.toHexString(repr.hashCode());
+      break;
+    case RANDOM:
+      alias = prefix + Integer.toHexString(java.util.concurrent.ThreadLocalRandom.current().nextInt());
+      break;
+    } 
+    // For extremely rare case of hash collision, just append something until unique
+    while (existing.containsKey(alias)) {
+      alias += "Q";
+    }
+    return alias;
   }
-  private <V> String addAlias(String prefix, V field, Map<String, V> existing) {
-    String alias = getAlias(prefix, existing);
+  private <V> String addAlias(String prefix, V field, String repr, Map<String, V> existing) {
+    String alias = getAlias(prefix, repr, existing);
     existing.put(alias, field);
     return alias;
   }
   private Map<String, String> aliasFields(Set<String> fields, String prefix) {
     Map<String, String> aliasedFields = new HashMap<>();
     for (String field : fields) {
-      addAlias(prefix, field, aliasedFields);
+      addAlias(prefix, field, field, aliasedFields);
     }
     return aliasedFields;
   }
@@ -261,8 +292,8 @@ public class DynamoDBClient extends DB {
       StringBuilder keyConditionExpression = new StringBuilder();
       String separator = "";
       for (Entry<String, AttributeValue> attr : key.entrySet()) {
-        String nameAlias = addAlias("#", attr.getKey(), attrNames);
-        String valueAlias = addAlias(":", attr.getValue(), attrValues);
+        String nameAlias = addAlias("#", attr.getKey(), attr.getKey(), attrNames);
+        String valueAlias = addAlias(":", attr.getValue(), attr.getValue().getS(), attrValues);
         keyConditionExpression.append(separator).append(nameAlias).append("=").append(valueAlias);
         separator = " AND ";
       }
@@ -421,16 +452,16 @@ public class DynamoDBClient extends DB {
       String separator = "SET ";
       for (Entry<String, ByteIterator> val : values.entrySet()) {
         AttributeValue v = new AttributeValue(val.getValue().toString());
-        String nameAlias = addAlias("#", val.getKey(), attrNames);
-        String valueAlias = addAlias(":", v, attrValues);
+        String nameAlias = addAlias("#", val.getKey(), val.getKey(), attrNames);
+        String valueAlias = addAlias(":", v, v.getS(), attrValues);
         updateExpression.append(separator).append(nameAlias).append("=").append(valueAlias);
         separator = ",";
       }
       if (null != this.ttlKeyName) {
         AttributeValue v = new AttributeValue().withN(
             String.valueOf((System.currentTimeMillis() / 1000L) + this.ttlDuration));
-        String nameAlias = addAlias("#", this.ttlKeyName, attrNames);
-        String valueAlias = addAlias(":", v, attrValues);
+        String nameAlias = addAlias("#", this.ttlKeyName, this.ttlKeyName, attrNames);
+        String valueAlias = addAlias(":", v, v.getN(), attrValues);
         updateExpression.append(separator).append(nameAlias).append("=").append(valueAlias);
       }
       req.setExpressionAttributeNames(attrNames);
