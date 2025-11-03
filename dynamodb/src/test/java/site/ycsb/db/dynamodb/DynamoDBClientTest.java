@@ -21,15 +21,13 @@ import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.notNullValue;
-import static org.hamcrest.Matchers.nullValue;
 
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.client.builder.AwsClientBuilder;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
-import com.amazonaws.services.dynamodbv2.model.*;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+
 import com.google.common.collect.Sets;
 
 import org.junit.*;
@@ -49,6 +47,8 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.Vector;
 import java.util.stream.Collectors;
+import java.net.URI;
+
 
 /**
  * Integration tests for the DynamoDB client using Scylla's Alternator interface
@@ -56,7 +56,6 @@ import java.util.stream.Collectors;
 public class DynamoDBClientTest {
   private static String HOST;
   private static int PORT;
-  private static java.io.File tempCredFile;
 
   public static ScyllaDBContainer scyllaContainer;
 
@@ -82,18 +81,6 @@ public class DynamoDBClientTest {
     } catch (Throwable t) {
       Assume.assumeTrue("Skipping DynamoDB tests because Docker/Testcontainers is not available: " + t.getMessage(), false);
     }
-
-    // Create a temporary credentials file for the test
-    try {
-      tempCredFile = java.io.File.createTempFile("aws-credentials", ".properties");
-      tempCredFile.deleteOnExit();
-      try (java.io.FileWriter writer = new java.io.FileWriter(tempCredFile)) {
-        writer.write("accessKey=dummy\n");
-        writer.write("secretKey=dummy\n");
-      }
-    } catch (java.io.IOException e) {
-      throw new RuntimeException("Failed to create temporary credentials file", e);
-    }
   }
 
   @AfterClass
@@ -105,7 +92,7 @@ public class DynamoDBClientTest {
   }
 
   private DynamoDBClient ycsbClient;
-  private AmazonDynamoDB awsClient;
+  private DynamoDbClient awsClient;
 
   @Rule
   public TestName testName = new TestName();
@@ -116,37 +103,41 @@ public class DynamoDBClientTest {
   private void createTable() throws InterruptedException {
     try {
       // Create DynamoDB table
-      CreateTableRequest createTableRequest = new CreateTableRequest()
-          .withTableName(TABLE())
-          .withKeySchema(new KeySchemaElement("y_id", KeyType.HASH))
-          .withBillingMode(BillingMode.PAY_PER_REQUEST);
+      CreateTableRequest.Builder createTableRequestBuilder = CreateTableRequest.builder()
+          .tableName(TABLE())
+          .keySchema(KeySchemaElement.builder()
+              .attributeName("y_id")
+              .keyType(KeyType.HASH)
+              .build())
+          .billingMode(BillingMode.PAY_PER_REQUEST);
       if (testName.getMethodName().contains("SecondaryIndex")) {
-        createTableRequest = createTableRequest.withAttributeDefinitions(
-              new AttributeDefinition("y_id", ScalarAttributeType.S),
-              new AttributeDefinition(fieldName(0), ScalarAttributeType.S)
-            ).withGlobalSecondaryIndexes(new GlobalSecondaryIndex()
-              .withIndexName("field0-index")
-              .withKeySchema(new KeySchemaElement(fieldName(0), KeyType.HASH))
-              .withProjection(new Projection().withProjectionType(ProjectionType.ALL)));
+        createTableRequestBuilder.attributeDefinitions(
+              AttributeDefinition.builder().attributeName("y_id").attributeType(ScalarAttributeType.S).build(),
+              AttributeDefinition.builder().attributeName(fieldName(0)).attributeType(ScalarAttributeType.S).build()
+            ).globalSecondaryIndexes(GlobalSecondaryIndex.builder()
+              .indexName("field0-index")
+              .keySchema(KeySchemaElement.builder().attributeName(fieldName(0)).keyType(KeyType.HASH).build())
+              .projection(Projection.builder().projectionType(ProjectionType.ALL).build())
+              .build());
       } else {
-        createTableRequest = createTableRequest.withAttributeDefinitions(
-              new AttributeDefinition("y_id", ScalarAttributeType.S));
+        createTableRequestBuilder.attributeDefinitions(
+              AttributeDefinition.builder().attributeName("y_id").attributeType(ScalarAttributeType.S).build());
       }
-      awsClient.createTable(createTableRequest);
+      awsClient.createTable(createTableRequestBuilder.build());
     } catch (ResourceInUseException e) {
       // Table already exists, ignore
     }
-      
+  
     // Wait for table to be active - simple polling approach
     int attempts = 0;
     while (attempts < 30) {
       try {
-        TableDescription result = awsClient.describeTable(TABLE()).getTable();
-        boolean tableActive = "ACTIVE".equals(result.getTableStatus());
-        boolean indexActive = result.getGlobalSecondaryIndexes() == null
-          || result.getGlobalSecondaryIndexes().stream().allMatch(
-                      gsi -> "ACTIVE".equals(gsi.getIndexStatus()));
-        
+        TableDescription result = awsClient.describeTable(
+          DescribeTableRequest.builder().tableName(TABLE()).build()).table();
+        boolean tableActive = TableStatus.ACTIVE.equals(result.tableStatus());
+        boolean indexActive = result.globalSecondaryIndexes() == null
+          || result.globalSecondaryIndexes().stream().allMatch(
+                      gsi -> TableStatus.ACTIVE.equals(gsi.indexStatus()));
         if (tableActive && indexActive) {
           return;
         }
@@ -159,11 +150,11 @@ public class DynamoDBClientTest {
   @Before
   public void setUpTable() throws Exception {
     // Create DynamoDB client pointing to Scylla's Alternator interface
-    BasicAWSCredentials awsCreds = new BasicAWSCredentials("dummy", "dummy");
-    awsClient = AmazonDynamoDBClientBuilder.standard()
-        .withCredentials(new AWSStaticCredentialsProvider(awsCreds))
-        .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(
-            "http://" + HOST + ":" + PORT, "us-east-1"))
+    awsClient = DynamoDbClient.builder()
+        .credentialsProvider(StaticCredentialsProvider.create(
+          AwsBasicCredentials.builder().accessKeyId("dummy").secretAccessKey("dummy").build()))
+        .endpointOverride(URI.create("http://" + HOST + ":" + PORT))
+        .region(Region.of("us-east-1"))
         .build();
 
     // Create table
@@ -173,7 +164,7 @@ public class DynamoDBClientTest {
   @After
   public void clearTable() {
     try {
-      awsClient.deleteTable(TABLE());
+      awsClient.deleteTable(DeleteTableRequest.builder().tableName(TABLE()).build());
     } catch (Exception e) {
       // Ignore cleanup errors
     }
@@ -183,7 +174,6 @@ public class DynamoDBClientTest {
   public void setUpClient() throws Exception {
     Properties p = new Properties();
     p.setProperty("dynamodb.endpoint", "http://" + HOST + ":" + PORT);
-    p.setProperty("dynamodb.awsCredentialsFile", tempCredFile.getAbsolutePath());
     p.setProperty("dynamodb.primaryKey", "y_id");
     p.setProperty("dynamodb.region", "us-east-1");
     p.setProperty("table", TABLE());
@@ -222,13 +212,14 @@ public class DynamoDBClientTest {
   private void insertRows(int count) {
     for (int i = 0; i < count; i++) {
       Map<String, AttributeValue> item = new HashMap<>();
-      item.put("y_id", new AttributeValue(keyValue(i)));
-      item.put(fieldName(0), new AttributeValue(fieldValue(i, 0)));
-      item.put(fieldName(1), new AttributeValue(fieldValue(i, 1)));
+      item.put("y_id", AttributeValue.fromS(keyValue(i)));
+      item.put(fieldName(0), AttributeValue.fromS(fieldValue(i, 0)));
+      item.put(fieldName(1), AttributeValue.fromS(fieldValue(i, 1)));
 
-      PutItemRequest putItemRequest = new PutItemRequest()
-          .withTableName(TABLE())
-          .withItem(item);
+      PutItemRequest putItemRequest = PutItemRequest.builder()
+          .tableName(TABLE())
+          .item(item)
+          .build();
       awsClient.putItem(putItemRequest);
     }
   }
@@ -290,14 +281,15 @@ public class DynamoDBClientTest {
     assertThat(status, is(Status.OK));
 
     // Verify result
-    GetItemRequest getItemRequest = new GetItemRequest()
-        .withTableName(TABLE())
-        .withKey(Map.of("y_id", new AttributeValue(key)));
+    GetItemRequest getItemRequest = GetItemRequest.builder()
+        .tableName(TABLE())
+        .key(Map.of("y_id", AttributeValue.fromS(key)))
+        .build();
 
-    GetItemResult getItemResult = awsClient.getItem(getItemRequest);
-    assertThat(getItemResult.getItem(), notNullValue());
-    assertThat(getItemResult.getItem().get(fieldName(0)).getS(), is(fieldValue(0)));
-    assertThat(getItemResult.getItem().get(fieldName(1)).getS(), is(fieldValue(1)));
+    GetItemResponse getItemResult = awsClient.getItem(getItemRequest);
+    assertThat(getItemResult.hasItem(), is(true));
+    assertThat(getItemResult.item().get(fieldName(0)).s(), is(fieldValue(0)));
+    assertThat(getItemResult.item().get(fieldName(1)).s(), is(fieldValue(1)));
   }
 
   @Test
@@ -312,14 +304,15 @@ public class DynamoDBClientTest {
     assertThat(status, is(Status.OK));
 
     // Verify result
-    GetItemRequest getItemRequest = new GetItemRequest()
-        .withTableName(TABLE())
-        .withKey(Map.of("y_id", new AttributeValue(keyValue())));
+    GetItemRequest getItemRequest = GetItemRequest.builder()
+        .tableName(TABLE())
+        .key(Map.of("y_id", AttributeValue.fromS(keyValue())))
+        .build();
 
-    GetItemResult getItemResult = awsClient.getItem(getItemRequest);
-    assertThat(getItemResult.getItem(), notNullValue());
-    assertThat(getItemResult.getItem().get(fieldName(0)).getS(), is("new-value1"));
-    assertThat(getItemResult.getItem().get(fieldName(1)).getS(), is("new-value2"));
+    GetItemResponse getItemResult = awsClient.getItem(getItemRequest);
+    assertThat(getItemResult.hasItem(), is(true));
+    assertThat(getItemResult.item().get(fieldName(0)).s(), is("new-value1"));
+    assertThat(getItemResult.item().get(fieldName(1)).s(), is("new-value2"));
   }
 
   @Test
@@ -330,12 +323,13 @@ public class DynamoDBClientTest {
     assertThat(status, is(Status.OK));
 
     // Verify result
-    GetItemRequest getItemRequest = new GetItemRequest()
-        .withTableName(TABLE())
-        .withKey(Map.of("y_id", new AttributeValue(keyValue())));
+    GetItemRequest getItemRequest = GetItemRequest.builder()
+        .tableName(TABLE())
+        .key(Map.of("y_id", AttributeValue.fromS(keyValue())))
+        .build();
 
-    GetItemResult getItemResult = awsClient.getItem(getItemRequest);
-    assertThat(getItemResult.getItem(), nullValue());
+    GetItemResponse getItemResult = awsClient.getItem(getItemRequest);
+    assertThat(getItemResult.hasItem(), is(false));
   }
 
   private void assertRows(int expected, Vector<HashMap<String, ByteIterator>> results) {
